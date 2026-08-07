@@ -24,8 +24,7 @@ def run_flask():
 TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-FLIBUSTA_SEARCH_OPDS = "https://flibusta.is/opds/search?searchType=books&searchTerm="
-FLIBUSTA_SEARCH_WEB = "https://flibusta.is/booksearch?ask="
+FLIBUSTA_BASE = "https://flibusta.is"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def extract_book_id(entry):
@@ -41,10 +40,11 @@ def extract_book_id(entry):
             return match.group(1)
     return None
 
-def fetch_opds(search_term):
+def fetch_opds_books(search_term):
+    """Поиск книг по OPDS"""
     found = []
     try:
-        url = FLIBUSTA_SEARCH_OPDS + urllib.parse.quote(search_term)
+        url = f"{FLIBUSTA_BASE}/opds/search?searchType=books&searchTerm=" + urllib.parse.quote(search_term)
         res = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=10)
         soup = BeautifulSoup(res.content, 'xml')
         for entry in soup.find_all('entry'):
@@ -54,6 +54,48 @@ def fetch_opds(search_term):
             b_author = author_elem.find('name').text if author_elem and author_elem.find('name') else "Неизвестен"
             if b_id:
                 found.append({'id': b_id, 'title': b_title, 'author': b_author})
+    except Exception:
+        pass
+    return found
+
+def fetch_author_books_opds(author_name, title_keywords):
+    """Ищет автора по OPDS, берет его книги и фильтрует по ключевым словам из названия"""
+    found = []
+    try:
+        # 1. Ищем автора
+        search_url = f"{FLIBUSTA_BASE}/opds/search?searchType=authors&searchTerm=" + urllib.parse.quote(author_name)
+        res = requests.get(search_url, headers={'User-Agent': USER_AGENT}, timeout=10)
+        soup = BeautifulSoup(res.content, 'xml')
+        
+        author_href = None
+        author_real_name = author_name
+
+        for entry in soup.find_all('entry'):
+            link = entry.find('link', href=re.compile(r'/opds/a/\d+'))
+            if link:
+                author_href = link.get('href')
+                if entry.find('title'):
+                    author_real_name = entry.find('title').text
+                break
+
+        # 2. Если автор найден, загружаем список его книг
+        if author_href:
+            author_books_url = FLIBUSTA_BASE + author_href
+            res_books = requests.get(author_books_url, headers={'User-Agent': USER_AGENT}, timeout=10)
+            soup_books = BeautifulSoup(res_books.content, 'xml')
+
+            for entry in soup_books.find_all('entry'):
+                b_id = extract_book_id(entry)
+                b_title = entry.find('title').text if entry.find('title') else ""
+                
+                # Проверяем, содержатся ли ключевые слова в названии книги
+                title_lower = b_title.lower()
+                if b_id and any(kw.lower() in title_lower for kw in title_keywords):
+                    found.append({
+                        'id': b_id, 
+                        'title': b_title, 
+                        'author': author_real_name
+                    })
     except Exception:
         pass
     return found
@@ -68,15 +110,15 @@ def search_books(query):
             seen_ids.add(book_id)
             results.append({'id': book_id, 'title': title, 'author': author})
 
-    # 1. Прямой поиск в OPDS
-    for b in fetch_opds(query):
+    # 1. Прямой поиск книг по OPDS
+    for b in fetch_opds_books(query):
         add_result(b['id'], b['title'], b['author'])
         if len(results) >= 5:
             return results
 
-    # 2. Прямой поиск на сайте Флибусты
+    # 2. Прямой веб-поиск на сайте
     try:
-        url = FLIBUSTA_SEARCH_WEB + urllib.parse.quote(query)
+        url = f"{FLIBUSTA_BASE}/booksearch?ask=" + urllib.parse.quote(query)
         res = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         
@@ -99,22 +141,31 @@ def search_books(query):
     except Exception:
         pass
 
-    if results:
-        return results
-
-    # 3. Умный поиск (Smart Fallback) для комбинаций "Автор + Название"
+    # 3. Поиск через Автора (решает проблему запросов "Рэй Далио Принципы")
     words = [w for w in re.split(r'\s+', query) if len(w) > 1]
     if len(words) > 1:
+        # Пробуем первые N слов считать именем автора, а остальные — названием
+        for i in range(len(words) - 1, 0, -1):
+            author_candidate = " ".join(words[:i])
+            title_keywords = words[i:]
+            
+            author_results = fetch_author_books_opds(author_candidate, title_keywords)
+            for b in author_results:
+                add_result(b['id'], b['title'], b['author'])
+                if len(results) >= 5:
+                    return results
+
+    # 4. Умный поиск (Smart Fallback по одиночным словам)
+    if not results and len(words) > 1:
         query_words_lower = [w.lower() for w in words]
         sorted_words = sorted(words, key=lambda x: len(x), reverse=True)
         
         for search_word in sorted_words:
-            candidate_books = fetch_opds(search_word)
+            candidate_books = fetch_opds_books(search_word)
             scored_candidates = []
             
             for b in candidate_books:
                 full_text_lower = f"{b['title']} {b['author']}".lower()
-                # Считаем, сколько слов из запроса пользователя совпадают с автором или названием
                 match_count = sum(1 for qw in query_words_lower if qw in full_text_lower)
                 if match_count > 1:
                     scored_candidates.append((match_count, b))
@@ -185,7 +236,7 @@ def callback_download(call):
     bot.answer_callback_query(call.id, f"Скачиваю в формате {fmt.upper()}...")
     bot.send_chat_action(call.message.chat.id, 'upload_document')
     
-    url = f"https://flibusta.is/b/{book_id}/{fmt}"
+    url = f"{FLIBUSTA_BASE}/b/{book_id}/{fmt}"
     
     try:
         res = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=30)
