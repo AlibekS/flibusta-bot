@@ -24,7 +24,8 @@ def run_flask():
 TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-FLIBUSTA_SEARCH = "https://flibusta.is/opds/search?searchType=books&searchTerm="
+FLIBUSTA_SEARCH_OPDS = "https://flibusta.is/opds/search?searchType=books&searchTerm="
+FLIBUSTA_SEARCH_WEB = "https://flibusta.is/booksearch?ask="
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def extract_book_id(entry):
@@ -40,6 +41,53 @@ def extract_book_id(entry):
             return match.group(1)
     return None
 
+def search_books(query):
+    results = []
+    
+    # 1. Первая попытка: быстрый OPDS поиск
+    try:
+        url = FLIBUSTA_SEARCH_OPDS + urllib.parse.quote(query)
+        res = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=10)
+        soup = BeautifulSoup(res.content, 'xml')
+        entries = soup.find_all('entry')[:5]
+        
+        for entry in entries:
+            book_id = extract_book_id(entry)
+            title = entry.find('title').text if entry.find('title') else "Без названия"
+            author = entry.find('author').find('name').text if entry.find('author') and entry.find('author').find('name') else "Неизвестен"
+            if book_id:
+                results.append({'id': book_id, 'title': title, 'author': author})
+    except Exception:
+        pass
+
+    # 2. Вторая попытка (если OPDS ничего не нашел): умный веб-поиск сайта
+    if not results:
+        try:
+            url = FLIBUSTA_SEARCH_WEB + urllib.parse.quote(query)
+            res = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=10)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            
+            main_div = soup.find('div', id='main') or soup
+            for a in main_div.find_all('a', href=True):
+                match = re.search(r'^/b/(\d+)$', a['href'])
+                if match:
+                    b_id = match.group(1)
+                    if not any(b['id'] == b_id for b in results):
+                        b_title = a.text.strip()
+                        parent_li = a.find_parent('li')
+                        b_author = "Неизвестен"
+                        if parent_li:
+                            author_a = parent_li.find('a', href=re.compile(r'^/a/'))
+                            if author_a:
+                                b_author = author_a.text.strip()
+                        results.append({'id': b_id, 'title': b_title, 'author': b_author})
+                        if len(results) >= 5:
+                            break
+        except Exception:
+            pass
+
+    return results
+
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(message, "👋 Привет! Напишите название книги или автора, и я найду её на Флибусте.")
@@ -51,45 +99,28 @@ def handle_search(message):
         return
 
     bot.send_chat_action(message.chat.id, 'typing')
+    books = search_books(query)
     
-    try:
-        url = FLIBUSTA_SEARCH + urllib.parse.quote(query)
-        res = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=15)
-        soup = BeautifulSoup(res.content, 'xml')
-        
-        entries = soup.find_all('entry')[:5]
-        if not entries:
-            bot.send_message(message.chat.id, "📚 По вашему запросу ничего не найдено.")
-            return
+    if not books:
+        bot.send_message(message.chat.id, "📚 По вашему запросу ничего не найдено.")
+        return
 
-        text = f"🔍 **Результаты поиска «{query}»:**\n\n"
-        markup = telebot.types.InlineKeyboardMarkup()
-        row_buttons = []
+    text = f"🔍 **Результаты поиска «{query}»:**\n\n"
+    markup = telebot.types.InlineKeyboardMarkup()
+    row_buttons = []
 
-        for i, entry in enumerate(entries, 1):
-            title = entry.find('title').text if entry.find('title') else "Без названия"
-            author = entry.find('author').find('name').text if entry.find('author') and entry.find('author').find('name') else "Неизвестен"
-            book_id = extract_book_id(entry)
-            
-            text += f"**{i}. {title}** — *{author}*\n\n"
-            
-            if book_id:
-                # Обрезаем длинный заголовок для кнопки
-                short_title = title[:15] + "..." if len(title) > 15 else title
-                row_buttons.append(
-                    telebot.types.InlineKeyboardButton(f"📖 {i}. {short_title}", callback_data=f"book_{book_id}")
-                )
+    for i, book in enumerate(books, 1):
+        text += f"**{i}. {book['title']}** — *{book['author']}*\n\n"
+        short_title = book['title'][:15] + "..." if len(book['title']) > 15 else book['title']
+        row_buttons.append(
+            telebot.types.InlineKeyboardButton(f"📖 {i}. {short_title}", callback_data=f"book_{book['id']}")
+        )
 
-        # Раскладываем кнопки выбора книги
-        for btn in row_buttons:
-            markup.add(btn)
+    for btn in row_buttons:
+        markup.add(btn)
 
-        bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=markup)
+    bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=markup)
 
-    except Exception as e:
-        bot.send_message(message.chat.id, "⚠️ Ошибка при обращении к Флибусте. Попробуйте чуть позже.")
-
-# --- Обработчик нажатия на книгу (выбор формата) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('book_'))
 def callback_book_select(call):
     book_id = call.data.split('_')[1]
@@ -108,7 +139,6 @@ def callback_book_select(call):
         reply_markup=markup
     )
 
-# --- Обработчик скачивания и отправки файла ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('dl_'))
 def callback_download(call):
     _, book_id, fmt = call.data.split('_')
@@ -121,7 +151,6 @@ def callback_download(call):
     try:
         res = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=30)
         if res.status_code == 200:
-            # Определение имени файла из заголовка или генерация
             cd = res.headers.get('content-disposition', '')
             filename = None
             if 'filename=' in cd:
@@ -132,7 +161,6 @@ def callback_download(call):
             if not filename:
                 filename = f"book_{book_id}.{fmt}"
 
-            # Загрузка файла в память и отправка в чат
             file_data = io.BytesIO(res.content)
             file_data.name = filename
             
@@ -142,7 +170,7 @@ def callback_download(call):
                 call.message.chat.id, 
                 f"⚠️ Формат **{fmt.upper()}** недоступен для этой книги или произошла ошибка скачивания."
             )
-    except Exception as e:
+    except Exception:
         bot.send_message(call.message.chat.id, "⚠️ Ошибка при загрузке файла. Попробуйте другой формат.")
 
 if __name__ == '__main__':
