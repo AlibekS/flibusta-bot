@@ -1,5 +1,5 @@
 pyTelegramBotAPI>=4.14
-requests>=2.31
+requests[socks]>=2.31
 beautifulsoup4>=4.12
 lxml>=5.0
 flask>=3.0

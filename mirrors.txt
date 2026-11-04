@@ -5,3 +5,5 @@ https://flibusta.is
 https://flibusta.site
 https://flisland.net
 https://flibusta.net
+# onion-зеркала используются только при включённом Tor (TOR_PROXY) и в последнюю очередь
+http://flibustaongezhld6dibs2dps6vm4nvqg2kp7vgowbu76tzopgnhazqd.onion

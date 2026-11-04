@@ -4,7 +4,10 @@ import re
 import html
 import logging
 import threading
+import time
 import urllib.parse
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import telebot
@@ -40,11 +43,51 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не задана переменная окружения BOT_TOKEN")
 
-bot = telebot.TeleBot(TOKEN)
+# По умолчанию у telebot всего 2 потока-обработчика: третий пользователь ждал,
+# пока закончатся чужие поиски. Поднимаем до 8.
+bot = telebot.TeleBot(TOKEN, num_threads=int(os.environ.get("BOT_THREADS", "8")))
 flibusta = mirrors.from_env()
 
 MAX_RESULTS = 5
 TELEGRAM_FILE_LIMIT = 50 * 1024 * 1024  # боты не могут отправлять файлы больше 50 МБ
+
+# Общий пул для параллельных запросов к Флибусте во время поиска
+search_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="search")
+
+
+class TTLCache:
+    """Потокобезопасный LRU-кэш с временем жизни записей."""
+
+    def __init__(self, maxsize=500, ttl=3600):
+        self.maxsize, self.ttl = maxsize, ttl
+        self._data = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            item = self._data.get(key)
+            if item is None:
+                return None
+            value, expires = item
+            if expires < time.time():
+                del self._data[key]
+                return None
+            self._data.move_to_end(key)
+            return value
+
+    def set(self, key, value):
+        with self._lock:
+            self._data[key] = (value, time.time() + self.ttl)
+            self._data.move_to_end(key)
+            while len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+
+
+# Результаты поиска: повторный запрос того же — мгновенно
+search_cache = TTLCache(maxsize=1000, ttl=int(os.environ.get("SEARCH_CACHE_TTL", "3600")))
+# file_id уже отправленных файлов: Telegram хранит их у себя, повторная
+# отправка той же книги не требует скачивания с Флибусты вообще
+file_id_cache = TTLCache(maxsize=5000, ttl=30 * 24 * 3600)
 
 
 def is_opds(res):
@@ -163,6 +206,21 @@ def fetch_web_search(query):
 
 def search_books(query):
     query = query.strip()
+    key = re.sub(r'\s+', ' ', query.lower())
+    cached = search_cache.get(key)
+    if cached is not None:
+        return cached
+    results = _search_books(query)
+    if results:  # пустой результат не кэшируем — вдруг это был сбой
+        search_cache.set(key, results)
+    return results
+
+
+def _search_books(query):
+    """Поиск в несколько стратегий. Независимые запросы выполняются
+    параллельно, а результаты объединяются в порядке приоритета стратегий,
+    поэтому выдача такая же, как при последовательном поиске, но время
+    ответа — как у самого медленного запроса, а не сумма всех."""
     results = []
     seen_ids = set()
 
@@ -176,28 +234,34 @@ def search_books(query):
                     return True
         return False
 
-    # 1. Прямой поиск книг по OPDS
-    if add_all(fetch_opds_books(query)):
-        return results
-
-    # 2. Прямой веб-поиск на сайте
-    if add_all(fetch_web_search(query)):
-        return results
-
-    # 3. Поиск через Автора (решает проблему запросов "Рэй Далио Принципы")
     words = [w for w in re.split(r'\s+', query) if len(w) > 1]
-    if len(words) > 1:
-        # Пробуем первые N слов считать именем автора, а остальные — названием
-        for i in range(len(words) - 1, 0, -1):
-            if add_all(fetch_author_books_opds(" ".join(words[:i]), words[i:])):
-                return results
 
-    # 4. Умный поиск (Smart Fallback по одиночным словам)
+    # Этапы 1–3 запускаем одновременно (в порядке приоритета):
+    # 1. Прямой поиск книг по OPDS
+    # 2. Прямой веб-поиск на сайте
+    # 3. Поиск через автора (решает проблему запросов "Рэй Далио Принципы"):
+    #    пробуем первые N слов считать именем автора, а остальные — названием
+    futures = [
+        search_pool.submit(fetch_opds_books, query),
+        search_pool.submit(fetch_web_search, query),
+    ]
+    if len(words) > 1:
+        # Ограничиваем число вариантов, чтобы длинный запрос не породил десятки запросов
+        for i in range(len(words) - 1, max(0, len(words) - 4), -1):
+            futures.append(search_pool.submit(fetch_author_books_opds, " ".join(words[:i]), words[i:]))
+
+    for fut in futures:
+        if add_all(fut.result()):
+            return results
+
+    # 4. Умный поиск (Smart Fallback по одиночным словам) — тоже параллельно
     if not results and len(words) > 1:
         query_words_lower = [w.lower() for w in words]
-        for search_word in sorted(words, key=len, reverse=True):
+        sorted_words = sorted(words, key=len, reverse=True)[:4]
+        word_futures = [search_pool.submit(fetch_opds_books, w) for w in sorted_words]
+        for fut in word_futures:
             scored = []
-            for b in fetch_opds_books(search_word):
+            for b in fut.result():
                 full_text_lower = f"{b['title']} {b['author']}".lower()
                 match_count = sum(1 for qw in query_words_lower if qw in full_text_lower)
                 if match_count > 1:
@@ -277,12 +341,20 @@ def callback_download(call):
     bot.answer_callback_query(call.id, f"Скачиваю в формате {fmt.upper()}...")
     bot.send_chat_action(call.message.chat.id, 'upload_document')
 
+    cached_id = file_id_cache.get((book_id, fmt))
+    if cached_id:
+        try:
+            bot.send_document(call.message.chat.id, cached_id)
+            return
+        except telebot.apihelper.ApiTelegramException:
+            pass  # file_id протух — скачаем заново
+
     def is_book_file(res):
         # Вместо файла может прийти HTML-страница (заглушка провайдера, капча)
         return 'text/html' not in res.headers.get('content-type', '')
 
     try:
-        res = flibusta.get(f"/b/{book_id}/{fmt}", validate=is_book_file, timeout=60)
+        res = flibusta.get(f"/b/{book_id}/{fmt}", validate=is_book_file, timeout=90)
         if res.status_code != 200 or not is_book_file(res):
             bot.send_message(
                 call.message.chat.id,
@@ -312,7 +384,9 @@ def callback_download(call):
 
         file_data = io.BytesIO(res.content)
         file_data.name = filename
-        bot.send_document(call.message.chat.id, file_data)
+        sent = bot.send_document(call.message.chat.id, file_data)
+        if sent.document:
+            file_id_cache.set((book_id, fmt), sent.document.file_id)
     except MirrorUnavailable:
         bot.send_message(call.message.chat.id, UNAVAILABLE_TEXT)
     except Exception:
@@ -327,5 +401,6 @@ if __name__ == '__main__':
     except MirrorUnavailable:
         log.error("При старте ни одно зеркало не отвечает, буду пробовать дальше")
     flibusta.start_background_check()
-    log.info("Бот успешно запущен, зеркало: %s", flibusta.base)
+    log.info("Бот успешно запущен, зеркало: %s, Tor: %s", flibusta.base,
+             "включён" if flibusta.tor_proxy else "выключен")
     bot.infinity_polling()

@@ -1,0 +1,6 @@
+.git
+__pycache__
+*.pyc
+mirror_state.json
+.env
+tests
