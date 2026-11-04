@@ -22,10 +22,11 @@
 import json
 import logging
 import os
+import random
 import threading
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -51,6 +52,11 @@ USER_AGENT = (
 # Коды, при которых считаем, что проблема в зеркале, а не в запросе
 # (403/451 — типичный ответ блокировки, 52x — Cloudflare "origin down").
 BAD_STATUSES = {403, 451, 429} | set(range(500, 600))
+
+# Проверка зеркала делает настоящий поиск, а не просто открывает /opds:
+# бывает, что главная отвечает мгновенно, а поиск (база данных) висит.
+# Слово меняется, чтобы не попадать в кэш CDN.
+PROBE_TERMS = ["пушкин", "толстой", "чехов", "гоголь", "лермонтов", "тургенев"]
 
 
 class MirrorUnavailable(Exception):
@@ -87,11 +93,12 @@ class MirrorManager:
         remote_list_url=None,
         state_file="mirror_state.json",
         tor_proxy=None,
-        probe_timeout=8,
-        request_timeout=10,
+        probe_timeout=10,
+        request_timeout=15,
         tor_timeout=45,
         check_interval=600,
         failover_cooldown=60,
+        max_concurrency=6,
         session=None,
     ):
         self.session = session or requests.Session()
@@ -113,7 +120,9 @@ class MirrorManager:
         self._remote_fetched_at = 0
         self._lock = threading.Lock()
         self._last_failed_failover = 0
-        self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="probe")
+        self._pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="probe")
+        # Не заваливаем один сайт десятком одновременных запросов от одного IP
+        self._sem = threading.BoundedSemaphore(max_concurrency)
 
         saved = self._load_state()
         if saved and is_onion(saved) and not self.tor_proxy:
@@ -166,7 +175,7 @@ class MirrorManager:
             r = self.session.get(self.remote_list_url, timeout=self.probe_timeout)
             r.raise_for_status()
             mirrors = [m for m in map(normalize, r.text.splitlines()) if m]
-            if mirrors:
+            if mirrors and mirrors != self._remote:
                 self._remote = mirrors
                 log.info("Загружен удалённый список зеркал: %s", mirrors)
         except requests.RequestException as e:
@@ -199,30 +208,50 @@ class MirrorManager:
 
     def probe(self, base):
         """Возвращает фактический адрес зеркала (с учётом редиректа) или None."""
+        term = urllib.parse.quote(random.choice(PROBE_TERMS))
+        t = time.time()
         try:
             r = self.session.get(
-                base + "/opds",
+                f"{base}/opds/search?searchType=authors&searchTerm={term}",
                 allow_redirects=True,
                 **self._request_kwargs(base, self.probe_timeout),
             )
         except requests.RequestException as e:
-            log.debug("Зеркало %s недоступно: %s", base, e)
+            log.info("Проверка %s: недоступно (%s)", base, type(e).__name__)
             return None
         if r.status_code != 200 or not looks_like_opds(r.text):
-            log.debug("Зеркало %s ответило некорректно (HTTP %s)", base, r.status_code)
+            log.info("Проверка %s: некорректный ответ (HTTP %s)", base, r.status_code)
             return None
         final = normalize(r.url) or base
-        if final != base:
-            log.info("Зеркало %s перенаправляет на %s", base, final)
+        log.info("Проверка %s: OK за %.1f с%s", base, time.time() - t,
+                 f" (перенаправляет на {final})" if final != base else "")
         return final
 
-    def _select(self, cands):
-        """Проверяет кандидатов параллельно и возвращает первого рабочего ПО
-        ПРИОРИТЕТУ, не дожидаясь медленных (например onion) кандидатов, если
-        более приоритетный уже ответил."""
+    def _race(self, cands):
+        """Проверяет кандидатов параллельно, возвращает самого быстрого рабочего."""
+        if not cands:
+            return None
         futures = [self._pool.submit(self.probe, c) for c in cands]
-        for fut in futures:
+        for fut in as_completed(futures):
             final = fut.result()
+            if final:
+                return final
+        return None
+
+    def _select(self, cands, demote=None):
+        """Выбор зеркала по уровням: сначала https, потом http-варианты, потом
+        onion. Внутри уровня побеждает самое быстрое. Зеркало `demote`
+        (только что подвело) рассматривается в последнюю очередь, иначе бот
+        возвращается на «полуживой» сайт, у которого открывается главная,
+        но не работает поиск."""
+        tiers = [
+            [c for c in cands if c.startswith("https://") and c != demote],
+            [c for c in cands if c.startswith("http://") and not is_onion(c) and c != demote],
+            [demote] if demote and not is_onion(demote) else [],
+            [c for c in cands if is_onion(c)],
+        ]
+        for tier in tiers:
+            final = self._race(tier)
             if final:
                 return final
         return None
@@ -243,11 +272,12 @@ class MirrorManager:
             if time.time() - self._last_failed_failover < self.failover_cooldown:
                 raise MirrorUnavailable("Все зеркала недоступны (кулдаун)")
 
+            failed = failed_base or self._current
             self._refresh_remote_list(force=True)
             cands = self.candidates()
-            log.warning("Зеркало %s не отвечает, проверяю: %s", failed_base or self._current, cands)
+            log.warning("Зеркало %s не отвечает, ищу замену среди: %s", failed, cands)
 
-            final = self._select(cands)
+            final = self._select(cands, demote=failed)
             if final:
                 self._switch(final)
                 return final
@@ -296,14 +326,16 @@ class MirrorManager:
         if time.time() - self._last_failed_failover < self.failover_cooldown:
             # Только что убедились, что всё лежит — не заставляем пользователя ждать таймаут
             raise MirrorUnavailable("Все зеркала недоступны (кулдаун)")
-        for attempt in range(2):
+        attempts = 3
+        for attempt in range(attempts):
             base = self._current
             try:
-                r = self.session.get(
-                    urllib.parse.urljoin(base + "/", path),
-                    **self._request_kwargs(base, timeout),
-                    **kwargs,
-                )
+                with self._sem:
+                    r = self.session.get(
+                        urllib.parse.urljoin(base + "/", path),
+                        **self._request_kwargs(base, timeout),
+                        **kwargs,
+                    )
                 bad = r.status_code in BAD_STATUSES or (
                     validate is not None and r.status_code == 200 and not validate(r)
                 )
@@ -319,7 +351,7 @@ class MirrorManager:
                     return r
             except requests.RequestException as e:
                 log.info("Ошибка запроса к %s: %s", base, e)
-                if attempt == 1:
+                if attempt == attempts - 1:
                     raise MirrorUnavailable(str(e)) from e
                 self.failover(failed_base=base)
         return r
@@ -356,4 +388,5 @@ def from_env():
         state_file=os.environ.get("MIRROR_STATE_FILE", "mirror_state.json"),
         tor_proxy=os.environ.get("TOR_PROXY") or None,
         check_interval=int(os.environ.get("MIRROR_CHECK_INTERVAL", "600")),
+        max_concurrency=int(os.environ.get("FLIBUSTA_MAX_CONCURRENCY", "6")),
     )

@@ -42,6 +42,24 @@ class FakeSession:
         return FakeResponse(url)
 
 
+class HalfAliveSession(FakeSession):
+    """Главная /opds отвечает мгновенно, а поиск висит (как flibusta.is в логах)."""
+
+    def __init__(self, half_alive, alive):
+        super().__init__(alive)
+        self.half_alive = half_alive
+
+    def get(self, url, **kw):
+        base = "/".join(url.split("/")[:3])
+        if base == self.half_alive:
+            with self.lock:
+                self.calls.append((base, kw.get("proxies"), kw.get("timeout")))
+            if "/opds/search" in url:
+                raise requests.ReadTimeout("read timed out")
+            return FakeResponse(url)
+        return super().get(url, **kw)
+
+
 class TorTests(unittest.TestCase):
     def mm(self, session, **kw):
         state = os.path.join(tempfile.mkdtemp(), "s.json")
@@ -77,6 +95,27 @@ class TorTests(unittest.TestCase):
         m.get("/opds")
         self.assertEqual(m.base, "https://b.example")
         self.assertLess(time.time() - t, 1.5)
+
+    def test_half_alive_mirror_is_replaced(self):
+        s = HalfAliveSession("https://a.example", {"https://b.example"})
+        m = self.mm(s)
+        r = m.get("/opds/search?searchType=books&searchTerm=x")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(m.base, "https://b.example")
+
+    def test_failed_mirror_demoted_but_used_if_only_one(self):
+        """Если «подведшее» зеркало — единственное живое, всё равно его берём."""
+        s = FakeSession({"https://a.example"})
+        m = self.mm(s)
+        self.assertEqual(m.failover(failed_base="https://a.example"), "https://a.example")
+
+    def test_fastest_mirror_wins(self):
+        s = FakeSession({"https://a.example", "https://b.example"},
+                        delays={"https://a.example": 1.0})
+        m = self.mm(s)
+        m._current = "https://dead.example"
+        m.failover(failed_base="https://dead.example")
+        self.assertEqual(m.base, "https://b.example")
 
     def test_returns_from_tor_when_clearnet_recovers(self):
         s = FakeSession({ONION})
