@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+mirror_state.json
+.env
